@@ -5,7 +5,7 @@ import akka.testkit.ImplicitSender
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.Matchers
 import org.scalatest.FunSuiteLike
-import akka.actor.ActorSystem
+import akka.actor.{ActorRef, ActorSystem}
 import akka.testkit.TestProbe
 import Arbiter._
 import Replicator._
@@ -95,41 +95,40 @@ class Step6_NewSecondarySpec extends TestKit(ActorSystem("Step6NewSecondarySpec"
 
     val arbiter = TestProbe()
 
-    def createSecondary(name: String) =
+    def createReplica(name: String) =
       system.actorOf(Replica.props(arbiter.ref,  Persistence.props(flaky = true)), name)
 
-    val primary = system.actorOf(Replica.props(arbiter.ref,  Persistence.props(flaky = true)), "case4-primary")
-    val secondary1 = createSecondary("case4-secondary1")
+    val primary = createReplica("case4-primary")
+
+    val secondaries = for {
+      i <- 0 to 4
+    } yield createReplica(s"case4-secondary${i}")
 
     val user = session(primary)
-    val user2 = session(secondary1)
 
     arbiter.expectMsg(Join)
     arbiter.send(primary, JoinedPrimary)
-    arbiter.send(secondary1, JoinedSecondary)
-    arbiter.send(primary, Replicas(Set(primary, secondary1)))
 
-    val ack1 = user.set("k1", "v1")
-    user.waitAck(ack1)
+    secondaries.foreach(s => arbiter.send(s, JoinedSecondary))
+    arbiter.send(primary, Replicas(Set(primary) ++ secondaries))
 
-    val ack2 = user.set("k1", "v2")
-    user.waitAck(ack2)
+    user.setAcked("k1", "v1")
+    user.setAcked("a", "1")
+    user.setAcked("k1", "v2")
+    user.setAcked("a", "2")
 
-    user2.getAndVerify("k1", Some("v2"))
+    secondaries.foreach(s => {
+      val sessioned = session(s)
+      sessioned.getAndVerify("a", Some("2"))
+    })
 
-    val secondary2 = createSecondary("case4-secondary2")
-    val user3 = session(secondary2)
-    arbiter.send(secondary2, JoinedSecondary)
-    arbiter.send(primary, Replicas(Set(primary, secondary1, secondary2)))
+    user.removeAcked("a")
 
-    user3.getAndVerify("k1", Some("v2"))
-
-    user.removeAcked("k1")
-
-    user2.getAndVerify("k1", None)
-    user3.getAndVerify("k1", None)
-
-
+    secondaries.foreach(s => {
+      val sessioned = session(s)
+      sessioned.getAndVerify("a", None)
+      sessioned.getAndVerify("k1", Some("v2"))
+    })
   }
 
 }

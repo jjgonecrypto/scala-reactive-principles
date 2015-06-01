@@ -16,7 +16,7 @@ object Replicator {
   def props(replica: ActorRef): Props = Props(new Replicator(replica))
 }
 
-class Replicator(val replica: ActorRef) extends Actor {
+class Replicator(val replica: ActorRef) extends Actor with akka.actor.ActorLogging {
   import Replicator._
   import Replica._
   import context.dispatcher
@@ -26,9 +26,6 @@ class Replicator(val replica: ActorRef) extends Actor {
   // map from sequence number to pair of sender and request
   var acks = Map.empty[Long, (ActorRef, Replicate)]
 
-  // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
-//  var pending = Vector.empty[Snapshot]
-  
   var _seqCounter = 0L
   def nextSeq = {
     val ret = _seqCounter
@@ -50,13 +47,15 @@ class Replicator(val replica: ActorRef) extends Actor {
     }
 
     case SnapshotAck(key, seq) => {
-      acks(seq) match {
-        case (s, Replicate(key, _, id)) => {
-          // remove sequence from list
-          acks -= seq
+      if (acks.contains(seq)) {
+        acks(seq) match {
+          case (s, Replicate(key, _, id)) => {
+            // remove sequence from list
+            acks -= seq
 
-          // notify replication success
-          s ! Replicated(key, id)
+            // notify replication success
+            s ! Replicated(key, id)
+          }
         }
       }
     }

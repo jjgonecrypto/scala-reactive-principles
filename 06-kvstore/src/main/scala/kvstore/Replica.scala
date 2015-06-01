@@ -1,14 +1,13 @@
 package kvstore
 
-import akka.actor._
-import kvstore.Arbiter._
-import scala.collection.immutable.Queue
 import akka.actor.SupervisorStrategy.Restart
-import scala.annotation.tailrec
-import akka.pattern.{AskTimeoutException, ask, pipe}
+import akka.actor._
+import akka.pattern.{AskTimeoutException, ask}
+import kvstore.Arbiter._
+import scala.concurrent.Future
+
 import scala.concurrent.duration._
-import akka.util.Timeout
-import akka.actor.SupervisorStrategy._
+import scala.util.{Failure, Success}
 
 object Replica {
   sealed trait Operation {
@@ -28,9 +27,9 @@ object Replica {
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
+  import Persistence._
   import Replica._
   import Replicator._
-  import Persistence._
   import context.dispatcher
 
   context.setReceiveTimeout(100.millis)
@@ -50,9 +49,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   var curSeq = 0L
 
-  // list of items awaiting confirmation from persistence layer
-  var pendingPersistence = Map.empty[Long, (ActorRef, Persist)]
-
   var isPrimary = false
 
   // start by notifying the arbiter of a join
@@ -66,83 +62,54 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case JoinedSecondary => context.become(replica)
   }
 
-  var persisted = Map.empty[Long, Boolean]
+  @volatile var pendingConfirmations = Map.empty[Long, (ActorRef, Any)]
 
-  def tryPersist(message: Persist, recipient: ActorRef) = {
-    // send off for persistence
-    (persistence ? message)(1.second)
-      .mapTo[Persisted]
-      .andThen {
-        // remove from pending list
-        case _ => {
-          pendingPersistence -= message.id
-          persisted += message.id -> true
+  def tryReplicateAndPersist(replicate: Replicate, persist:Persist, recipient: ActorRef) = {
+
+    val collection = Set((persistence ? persist)(1.second).mapTo[Persisted]) ++
+      replicators.map(r => (r ? replicate)(1.second).mapTo[Replicated])
+
+    val response = Future.traverse(collection)(x => x)
+
+    response.onComplete {
+      case Success(msg) => synchronized {
+        if (pendingConfirmations.contains(persist.id)) {
+          recipient ! OperationAck(persist.id)
+          pendingConfirmations -= persist.id
         }
       }
-      .filter(_ => !isPrimary || replicated.contains(message.id))
-      .map(reply => {
-
-        // send ack msg
-        if (isPrimary) {
-          OperationAck(reply.id)
-        } else {
-          SnapshotAck(reply.key, reply.id)
-        }
-      })
-      .recover {
-        case ex:AskTimeoutException => {
-          if (isPrimary) OperationFailed(message.id)
+      case Failure(ex) => synchronized {
+        if (pendingConfirmations.contains(persist.id)) {
+          recipient ! OperationFailed(persist.id)
+          pendingConfirmations -= persist.id
         }
       }
-      .onSuccess({ case v => recipient ! v })
-
+    }
   }
 
-  var replicated = Map.empty[Long, Boolean]
-
-  def tryReplicate(message: Replicate, recipient: ActorRef) = {
-    var awaitingResponse = replicators
-
-    if (replicators.isEmpty) replicated += message.id -> true
-
-    replicators.foreach(r => {
-      (r ? message)(1.second)
-        .mapTo[Replicated]
-        .andThen {
-          case _ => {
-            awaitingResponse -= r
-            if (awaitingResponse.isEmpty) replicated += message.id -> true
-          }
-        }
-        .filter(reply =>
-          replicated.contains(message.id) && persisted.contains(message.id)
-        )
-        .map(_ => {
-          OperationAck(message.id)
-        })
-        .recover {
-          case ex:AskTimeoutException => {
-            OperationFailed(message.id)
-          }
-        }
-        .onSuccess({ case v => recipient ! v })
-    })
+  def tryPersist(persist:Persist, recipient: ActorRef) = {
+    for {
+      response <- (persistence ? persist)(1.second).mapTo[Persisted].map(_ => SnapshotAck(persist.key, persist.id))
+    } yield recipient ! response
   }
 
   def updateReceived(key: String, valueOption: Option[String], id:Long) = {
     // send this message off to all replicators
-    tryReplicate(Replicate(key, valueOption, id), sender)
+    val replicate = Replicate(key, valueOption, id)
+    // and to persistence layer
+    val persist = Persist(key, valueOption, id)
 
-    val message = Persist(key, valueOption, id)
-    tryPersist(message, sender)
-
-    pendingPersistence += message.id -> (sender, message)
+    tryReplicateAndPersist(replicate, persist, sender)
+    pendingConfirmations += id -> (sender, (replicate, persist))
   }
 
   def handleRetries: Receive = {
     case ReceiveTimeout => {
       // when persistence hasn't replied, resend all
-      pendingPersistence.foreach { case (_, (s, message)) => tryPersist(message, s) }
+      pendingConfirmations.foreach {
+        case (_, (s, (replicate:Replicate, persist:Persist))) => tryReplicateAndPersist(replicate, persist, s)
+        case (_, (s, persist:Persist)) => tryPersist(persist, s)
+      }
     }
   }
 
@@ -220,7 +187,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
         tryPersist(message, sender)
 
-        pendingPersistence += message.id -> (sender, message)
+        pendingConfirmations += seq -> (sender, message)
 
         // and update our internal sequence counter
         curSeq += 1L
@@ -230,12 +197,6 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         // ack
         sender ! SnapshotAck(key, seq)
 
-      } else { // future seq
-
-        // ignore
-
-        // and update our sequencer ? no, right?
-        // curSeq = seq + 1
       }
     }
 
